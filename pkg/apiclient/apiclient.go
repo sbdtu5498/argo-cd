@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net"
 	"net/http"
@@ -37,6 +36,7 @@ import (
 	certificatepkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/certificate"
 	clusterpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/cluster"
 	gpgkeypkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/gpgkey"
+	notificationpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/notification"
 	projectpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/project"
 	repocredspkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/repocreds"
 	repositorypkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/repository"
@@ -45,6 +45,7 @@ import (
 	versionpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/version"
 	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	argoappv1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/v2/util/argo"
 	"github.com/argoproj/argo-cd/v2/util/env"
 	grpc_util "github.com/argoproj/argo-cd/v2/util/grpc"
 	http_util "github.com/argoproj/argo-cd/v2/util/http"
@@ -87,6 +88,8 @@ type Client interface {
 	NewGPGKeyClientOrDie() (io.Closer, gpgkeypkg.GPGKeyServiceClient)
 	NewApplicationClient() (io.Closer, applicationpkg.ApplicationServiceClient, error)
 	NewApplicationClientOrDie() (io.Closer, applicationpkg.ApplicationServiceClient)
+	NewNotificationClient() (io.Closer, notificationpkg.NotificationServiceClient, error)
+	NewNotificationClientOrDie() (io.Closer, notificationpkg.NotificationServiceClient)
 	NewSessionClient() (io.Closer, sessionpkg.SessionServiceClient, error)
 	NewSessionClientOrDie() (io.Closer, sessionpkg.SessionServiceClient)
 	NewSettingsClient() (io.Closer, settingspkg.SettingsServiceClient, error)
@@ -230,7 +233,7 @@ func NewClient(opts *ClientOptions) (Client, error) {
 	}
 	// Override certificate data if specified from CLI flag
 	if opts.CertFile != "" {
-		b, err := ioutil.ReadFile(opts.CertFile)
+		b, err := os.ReadFile(opts.CertFile)
 		if err != nil {
 			return nil, err
 		}
@@ -669,11 +672,28 @@ func (c *client) NewApplicationClient() (io.Closer, applicationpkg.ApplicationSe
 }
 
 func (c *client) NewApplicationClientOrDie() (io.Closer, applicationpkg.ApplicationServiceClient) {
-	conn, repoIf, err := c.NewApplicationClient()
+	conn, appIf, err := c.NewApplicationClient()
 	if err != nil {
 		log.Fatalf("Failed to establish connection to %s: %v", c.ServerAddr, err)
 	}
-	return conn, repoIf
+	return conn, appIf
+}
+
+func (c *client) NewNotificationClient() (io.Closer, notificationpkg.NotificationServiceClient, error) {
+	conn, closer, err := c.newConn()
+	if err != nil {
+		return nil, nil, err
+	}
+	notifIf := notificationpkg.NewNotificationServiceClient(conn)
+	return closer, notifIf, nil
+}
+
+func (c *client) NewNotificationClientOrDie() (io.Closer, notificationpkg.NotificationServiceClient) {
+	conn, notifIf, err := c.NewNotificationClient()
+	if err != nil {
+		log.Fatalf("Failed to establish connection to %s: %v", c.ServerAddr, err)
+	}
+	return conn, notifIf
 }
 
 func (c *client) NewSessionClient() (io.Closer, sessionpkg.SessionServiceClient, error) {
@@ -766,13 +786,18 @@ func (c *client) NewAccountClientOrDie() (io.Closer, accountpkg.AccountServiceCl
 func (c *client) WatchApplicationWithRetry(ctx context.Context, appName string, revision string) chan *argoappv1.ApplicationWatchEvent {
 	appEventsCh := make(chan *argoappv1.ApplicationWatchEvent)
 	cancelled := false
+	appName, appNs := argo.ParseAppQualifiedName(appName, "")
 	go func() {
 		defer close(appEventsCh)
 		for !cancelled {
 			conn, appIf, err := c.NewApplicationClient()
 			if err == nil {
 				var wc applicationpkg.ApplicationService_WatchClient
-				wc, err = appIf.Watch(ctx, &applicationpkg.ApplicationQuery{Name: &appName, ResourceVersion: &revision})
+				wc, err = appIf.Watch(ctx, &applicationpkg.ApplicationQuery{
+					Name:            &appName,
+					AppNamespace:    &appNs,
+					ResourceVersion: &revision,
+				})
 				if err == nil {
 					for {
 						var appEvent *v1alpha1.ApplicationWatchEvent
